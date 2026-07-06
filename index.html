@@ -201,7 +201,7 @@
     'use strict';
 
     // ----- Matter aliases -----
-    const { Engine, World, Bodies, Body, Composite, Composites, Constraint, Events, Vector } = Matter;
+    const { Engine, World, Bodies, Body, Composite, Composites, Constraint, Events, Sleeping, Vector } = Matter;
 
     // ----- Constants (locked) -----
     const CELL_SIZE = 28;
@@ -226,7 +226,7 @@
     // lets the constraint solver under-resolve (positional correction leaks
     // into velocity on the next step via position-positionPrev) and the piece
     // runs away to extreme y-positions.
-    const MAX_PARTICLE_VY = 4.5;
+    const MAX_PARTICLE_VY = 3.0;
     // Air friction per particle — smooths wobble AND prevents runaway velocity
     // buildup that would otherwise pull the constraint mesh apart.
     const PARTICLE_FRICTION_AIR = 0.04;
@@ -404,8 +404,12 @@
       // has uneven occupancy (like L, J, S, Z where top-row sub-particles
       // are only 2/4 wide). Without this, sparse bitmap shapes T-strands
       // apart and the piece visually stretches across the entire board.
-      const STIFF = 0.18;
-      const DAMP = 0.45;
+      //
+      // Stiffness: 0.55 is well under Matter.js's instability ceiling (≈0.7)
+      // but rigid enough that an active piece's constraint mesh holds together
+      // during a terminal-velocity impact on the floor/stack.
+      const STIFF = 0.55;
+      const DAMP = 0.55;
       function addConstraint(a, b, stiffness) {
         if (!a || !b) return;
         if (!(a.plugin && a.plugin.occupied)) return;
@@ -548,7 +552,7 @@
     // tick (capped at terminal velocity). Bypasses engine.gravity AND per-piece
     // applyForce, both of which failed to make pieces fall in this setup (the
     // constraint solver repeatedly zeroed velocity to maintain rest lengths).
-    const FALL_DV = 0.32; // Δv per tick at 60 Hz → ~1150 px/s² effective gravity
+    const FALL_DV = 0.18; // Δv per tick at 60 Hz (slower fall → less impact stretch)
     function applyGravity() {
       const dv = FALL_DV * (state.softDrop ? 3 : 1);
       const vMax = MAX_PARTICLE_VY;
@@ -619,32 +623,41 @@
     function isSettled(piece) {
       // Don't settle for the first 800 ms — give the piece time to fall.
       if (performance.now() - piece.bornAt < 800) return false;
+      const maxY = piece._maxYPrev !== undefined ? piece._maxYPrev : -Infinity;
+      const onFloorOrStack = maxY > BOARD_PX_H - 2 * CELL_SIZE;
+      const inPlayfield = maxY > 9 * CELL_SIZE;
+      // Hard timeout: if the piece has been alive for 2.5 s, force-lock it.
+      // Without this, pieces that oscillate > 2 px/step on the floor never
+      // settle — they remain "active" forever, dragging extra weight onto
+      // their constraint mesh and stretching it via frictionAir wobble.
+      if (performance.now() - piece.bornAt > 2500) return true;
+      // Standard settle (require stillness) — softened from speed < 2 → < 3
+      // because pieces resting on uneven stacks often bounce at 2-3 px/step.
       if (piece._maxYStableSince === undefined) return false;
       const stableMs = performance.now() - piece._maxYStableSince;
-      const maxY = piece._maxYPrev !== undefined ? piece._maxYPrev : -Infinity;
-      // Three conditions required to lock:
-      // (a) Speed is low AND has been at roughly the same height for ≥ 250 ms.
-      // (b) The piece has reached the playfield (below y = 9*CELL_SIZE, i.e.
-      //     well into the playing area).
-      // (c) The piece's lowest particle is BELOW the spawn zone (y > 6*CELL_SIZE)
-      //     so a newly-spawned piece can't immediately "land" on a stretched
-      //     piece that hasn't actually settled near the floor.
-      const reachedBoard = maxY > BOARD_Y + 9 * CELL_SIZE;
-      const belowSpawnZone = maxY > 6 * CELL_SIZE;
-      return reachedBoard && belowSpawnZone && stableMs > 250 && piece._lastSpeed < 2.0;
+      const settled = stableMs > 250 && piece._lastSpeed < 3.0;
+      // Either standard stability OR (hard floor contact + at least briefly stable)
+      return settled || (onFloorOrStack && stableMs > 100);
     }
 
     // ----- Lock piece -----
     function lockPiece(piece) {
       if (piece.locked) return;
       piece.locked = true;
-      // No more per-piece gravity (it's already settled; we want it frozen-ish).
-      // Keep particles but they will only move slightly under impact from above.
-      // Add some friction so they settle against each other.
+      // Production-proven soft-body lock pattern (Matter.js): freeze each
+      // particle via Sleeping + isStatic so the engine skips integration
+      // for locked bodies. Static bodies STILL collide with dynamic ones
+      // (that's how walls work in Matter.js), so incoming pieces pile on
+      // top exactly like in standard Tetris — without dragging the locked
+      // mesh apart via impact-induced constraint drift over time.
       for (const b of piece.composite.bodies) {
         if (b.label && b.label.endsWith('-live')) {
-          b.friction = 0.6;
-          b.frictionStatic = 0.8;
+          Body.setVelocity(b, { x: 0, y: 0 });
+          Body.setAngularVelocity(b, 0);
+          // isStatic + Sleeping is belt-and-suspenders: either alone works,
+          // but together they guarantee no position change no matter what.
+          b.isStatic = true;
+          Sleeping.set(b, true);
         }
       }
       // Give current = null only if it's the active piece
@@ -671,6 +684,10 @@
         if (count >= GRID_W * PARTICLES_PER_CELL * 0.6) full.push(row);
       }
       if (full.length === 0) return;
+      // Defensive cap: theoretical Tetris max is 4 rows per drop. Beyond that,
+      // it means stretched particles have over-counted; bound to [0..4] so
+      // table[full.length] can't become undefined and corrupt state.score.
+      if (full.length > 4) full.length = 4;
       // Mark particles for removal
       const toRemove = [];
       for (const p of state.pieces) {
@@ -949,21 +966,32 @@
           }
         }
 
-        // Settle detection for current piece
-        if (state.current && !state.current.locked) {
-          updateSettle(state.current);
-          if (isSettled(state.current)) {
-            // Lock the piece, then spawn next
-            lockPiece(state.current);
-            setTimeout(() => {
-              if (!state.gameOver && !state.current) spawnPiece();
-            }, 60);
+        // Settle detection. We iterate EVERY non-locked piece — not just
+        // state.current — because a piece that wasn't active when the
+        // previous lock fired can be left dangling forever otherwise (it
+        // never gets isSettled called again, so its particles keep moving
+        // and stretch the constraint mesh). When a piece is ready we lock
+        // it; only if state.current is the one we just locked do we queue
+        // a spawn for the next.
+        let nextShouldSpawn = false;
+        for (const p of state.pieces) {
+          if (p.locked) continue;
+          updateSettle(p);
+          if (isSettled(p)) {
+            const wasCurrent = (state.current === p);
+            lockPiece(p);
+            if (wasCurrent) nextShouldSpawn = true;
           }
+        }
+        if (nextShouldSpawn) {
+          setTimeout(() => {
+            if (!state.gameOver && !state.current) spawnPiece();
+          }, 60);
         }
 
         // Settle update for all locked pieces too (for wobbly rest state)
         for (const p of state.pieces) {
-          if (p !== state.current && p.locked) updateSettle(p);
+          if (p.locked) updateSettle(p);
         }
       }
 
@@ -1042,6 +1070,21 @@
           ctx.fillStyle = color + '99';
           ctx.strokeStyle = color;
           ctx.lineWidth = 1.5;
+
+          // Guard against "constraint explosion" rendering: when a piece's
+          // particles drifted apart mid-fall before lock, the renderer still
+          // connects adjacent sub-lattice indices. That makes a single quad
+          // span hundreds of pixels, painting vertical streaks. Skip any
+          // quad whose four corners cover more than 3 cells in either axis.
+          const dxQuad = Math.max(
+            Math.abs(a.position.x - d.position.x),
+            Math.abs(c.position.x - b2.position.x)
+          );
+          const dyQuad = Math.max(
+            Math.abs(a.position.y - b2.position.y),
+            Math.abs(c.position.y - d.position.y)
+          );
+          if (dxQuad > 3.5 * CELL_SIZE || dyQuad > 3.5 * CELL_SIZE) continue;
 
           // Two triangles: (a,c,b2) and (c,d,b2)
           ctx.beginPath();
