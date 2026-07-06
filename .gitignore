@@ -1,0 +1,11 @@
+# macOS metadata
+.DS_Store
+
+# Tooling metadata
+.omo/
+.codegraph/
+.playwright-mcp/
+
+# Local screenshot scratch
+/qa-*.png
+/check.png
