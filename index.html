@@ -2,7 +2,8 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<title>Jelly Tetris</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Jelly Tetris — Soft-Body Physics</title>
 <style>
   :root {
     --bg: #0a0a14;
@@ -10,6 +11,8 @@
     --ink: #e7e7f0;
     --muted: #8b8ba8;
     --accent: #22d3ee;
+    --danger: #ef4444;
+    --good: #22c55e;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   html, body {
@@ -18,6 +21,7 @@
     color: var(--ink);
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     overflow: hidden;
+    user-select: none;
   }
   body {
     display: flex;
@@ -57,17 +61,18 @@
     text-align: center;
     color: var(--ink);
     z-index: 5;
+    padding: 0 24px;
   }
   #overlay.on { display: flex; }
   #overlay h1 {
-    font-size: 42px;
+    font-size: 38px;
     letter-spacing: 6px;
-    color: #ef4444;
+    color: var(--danger);
     margin-bottom: 16px;
     text-shadow: 0 0 18px rgba(239, 68, 68, 0.4);
   }
-  #overlay p { font-size: 16px; margin: 4px 0; color: var(--muted); }
-  #overlay .final { font-size: 22px; color: var(--ink); margin: 8px 0 18px; }
+  #overlay p { font-size: 15px; margin: 4px 0; color: var(--muted); }
+  #overlay .final { font-size: 24px; color: var(--ink); margin: 8px 0 18px; font-weight: 700; }
   #overlay kbd {
     background: #1c1c34;
     border: 1px solid #2a2a4a;
@@ -94,13 +99,7 @@
     letter-spacing: 2px;
     color: var(--muted);
     text-transform: uppercase;
-    margin-bottom: 6px;
-  }
-  .panel .val {
-    font-size: 24px;
-    font-weight: 700;
-    font-variant-numeric: tabular-nums;
-    color: var(--ink);
+    margin-bottom: 8px;
   }
   .row { display: flex; justify-content: space-between; align-items: baseline; }
   .row .lbl {
@@ -110,8 +109,8 @@
     text-transform: uppercase;
   }
   .row .v {
-    font-size: 16px;
-    font-weight: 600;
+    font-size: 20px;
+    font-weight: 700;
     font-variant-numeric: tabular-nums;
   }
   #next-wrap {
@@ -162,7 +161,7 @@
       <div class="title">Jelly Tetris</div>
       <div class="subtitle">Soft-body physics</div>
       <div id="board-wrap">
-        <canvas id="board" width="280" height="560"></canvas>
+        <canvas id="board" width="300" height="600"></canvas>
         <div id="overlay">
           <h1>GAME OVER</h1>
           <p>Final Score</p>
@@ -180,7 +179,7 @@
       <div class="panel">
         <h2>Next</h2>
         <div id="next-wrap">
-          <canvas id="next" width="112" height="112"></canvas>
+          <canvas id="next" width="120" height="120"></canvas>
         </div>
       </div>
       <div class="panel help">
@@ -200,57 +199,164 @@
   (function () {
     'use strict';
 
-    // ----- Matter aliases -----
-    const { Engine, World, Bodies, Body, Composite, Composites, Constraint, Events, Sleeping, Vector } = Matter;
+    // ===================================================================
+    //  Jelly Tetris — single-file implementation
+    //  Each tetromino = 4 circle particles + constraints matching the
+    //  canonical silhouette. Movement uses Body.setVelocity on every
+    //  particle (atomic + physics-friendly). Lock via isStatic +
+    //  Sleeping.set so locked stacks no longer stretch.
+    // ===================================================================
 
-    // ----- Constants (locked) -----
-    const CELL_SIZE = 28;
+    const { Engine, World, Bodies, Body, Composite, Constraint, Events, Sleeping, Vector } = Matter;
+
+    // ----- Constants -----
+    const CELL_SIZE = 30;
     const GRID_W = 10;
     const GRID_H = 20;
-    const BOARD_PX_W = GRID_W * CELL_SIZE; // 280
-    const BOARD_PX_H = GRID_H * CELL_SIZE; // 560
+    const BOARD_PX_W = GRID_W * CELL_SIZE; // 300
+    const BOARD_PX_H = GRID_H * CELL_SIZE; // 600
     const BOARD_X = 0;
     const BOARD_Y = 0;
-    const PARTICLES_PER_CELL = 4; // 2x2
-    const PARTICLE_R = CELL_SIZE * 0.20;
-    const ROW_HALF = CELL_SIZE * 0.6;
-    // Per-piece gravity tuned empirically. With our particle mass ≈ 0.092 and
-    // frictionAir 0.01, BASE_GRAVITY=0.025 → terminal velocity ~2.5 px/step
-    // (≈150 px/s) so a piece falls the board in ~4 s. Anything much higher
-    // lets the constraint solver under-resolve (positional correction leaks
-    // into velocity on the next step via position-positionPrev) and the piece
-    // runs away to extreme y-positions.
-    // Engine gravity tuned empirically. With our particle mass ≈ 0.092 and
-    // frictionAir ≈ 0.04, gravity.y = 0.55 → terminal velocity ~3.5 px/step
-    // (≈210 px/s) so a piece falls the board in ~3 s. Anything much higher
-    // lets the constraint solver under-resolve (positional correction leaks
-    // into velocity on the next step via position-positionPrev) and the piece
-    // runs away to extreme y-positions.
-    const MAX_PARTICLE_VY = 3.0;
-    // Air friction per particle — smooths wobble AND prevents runaway velocity
-    // buildup that would otherwise pull the constraint mesh apart.
-    const PARTICLE_FRICTION_AIR = 0.04;
+
+    // Particle radius — large enough that adjacent cells overlap visually,
+    // creating a connected jelly look without needing dense mesh fills.
+    const PARTICLE_R = CELL_SIZE * 0.42;
+
+    // Per-particle physics tuning. Constraints stay stiff enough that the
+    // piece behaves as one jelly unit at rest, but springy enough that
+    // impacts visibly compress it. Damping is high to kill oscillation.
+    const PARTICLE_DENSITY = 0.002;
+    const PARTICLE_FRICTION_AIR = 0.06;
+    const PARTICLE_RESTITUTION = 0.05;
+    const PARTICLE_FRICTION = 0.15;
+    const STIFF = 0.45;
+    const DAMP = 0.55;
+
+    // Falling: per-tick downward Δv. Soft drop multiplies this. Capped so a
+    // collision never produces a velocity that snaps constraints.
+    // Tuning: with our per-frame Engine.update(16.67ms), FALL_DV=0.25 → step
+    // Δv≈4.2 px/step → terminal ≈250 px/s (general). Soft drop unlocks the
+    // higher cap so the piece noticeably accelerates (≈1000 px/s) — feels like
+    // a real "shove down" the way classic Tetris does.
+    const FALL_DV = 0.25;
+    const MAX_VY = 5.0;        // normal terminal velocity
+    const SOFT_DROP_MULT = 12;  // per-tick dv × this when softDrop held
+    const MAX_VY_SOFT = 18.0;   // higher cap while soft-dropping
+    const MAX_VX = 6.0;
+
+    // Lock detection: if a piece's particles have moved < LOCK_VEL_PX per
+    // frame for LOCK_FRAMES consecutive frames while in the lower half of
+    // the board, freeze it.
+    const LOCK_VEL_PX = 0.25;
+    const LOCK_FRAMES = 18;          // ~0.3 s at 60 fps
+    const HARD_LOCK_MS = 4500;       // force-lock if a piece lives this long
 
     const COLORS = {
-      I: '#22d3ee',
-      O: '#facc15',
-      T: '#a855f7',
-      S: '#22c55e',
-      Z: '#ef4444',
-      J: '#3b82f6',
-      L: '#fb923c',
+      I: '#22d3ee', // cyan
+      O: '#facc15', // yellow
+      T: '#a855f7', // purple
+      S: '#22c55e', // green
+      Z: '#ef4444', // red
+      J: '#3b82f6', // blue
+      L: '#fb923c', // orange
     };
 
-    // ----- Bitmaps (rotation 0) -----
-    // w/h are cell counts, cells[y][x] is 1 if filled.
-    const BITMAPS = {
-      I: { w: 4, h: 1, cells: [[1,1,1,1]] },
-      O: { w: 2, h: 2, cells: [[1,1],[1,1]] },
-      T: { w: 3, h: 2, cells: [[0,1,0],[1,1,1]] },
-      S: { w: 3, h: 2, cells: [[0,1,1],[1,1,0]] },
-      Z: { w: 3, h: 2, cells: [[1,1,0],[0,1,1]] },
-      J: { w: 3, h: 2, cells: [[1,0,0],[1,1,1]] },
-      L: { w: 3, h: 2, cells: [[0,0,1],[1,1,1]] },
+    // ----- Tetromino bitmaps (rotation 0) -----
+    // Each cell is occupied (1) or empty (0). Cells array indexed [y][x].
+    // We also define, for each tetromino, the canonical PARTICLE ORDER.
+    // The particle ORDER defines how constraints wire them — this guarantees
+    // the renderer draws a stable tetromino shape regardless of which cell
+    // index a particle currently occupies in world space.
+    //
+    // Convention: particle index 0 is the "anchor" cell (top-left of the
+    // bounding box for L, T, S, Z, J; leftmost for I; top-left for O).
+    const SHAPES = {
+      I: {
+        cells: [[1,1,1,1]],
+        // Particle indices: 0..3 left-to-right
+        particles: [
+          { dx: 0, dy: 0 }, { dx: 1, dy: 0 }, { dx: 2, dy: 0 }, { dx: 3, dy: 0 },
+        ],
+        // Constraints: connect adjacent particles in canonical order
+        constraints: [[0,1],[1,2],[2,3]],
+        // 4x1
+        w: 4, h: 1,
+      },
+      O: {
+        cells: [[1,1],[1,1]],
+        particles: [
+          { dx: 0, dy: 0 }, { dx: 1, dy: 0 },
+          { dx: 0, dy: 1 }, { dx: 1, dy: 1 },
+        ],
+        // Closed square — 4 edges + 2 diagonals for rigidity
+        constraints: [[0,1],[1,3],[3,2],[2,0],[0,3],[1,2]],
+        w: 2, h: 2,
+      },
+      T: {
+        // 3 wide, 2 tall: top-middle + bottom-row full
+        cells: [[0,1,0],[1,1,1]],
+        particles: [
+          { dx: 1, dy: 0 }, // top-center (index 0)
+          { dx: 0, dy: 1 }, // bottom-left (index 1)
+          { dx: 1, dy: 1 }, // bottom-center (index 2)
+          { dx: 2, dy: 1 }, // bottom-right (index 3)
+        ],
+        // T-shape: top-center connects to bottom-center; bottom row all connected
+        constraints: [[0,2],[1,2],[2,3]],
+        w: 3, h: 2,
+      },
+      S: {
+        // top-right 2 cells, bottom-left 2 cells
+        cells: [[0,1,1],[1,1,0]],
+        particles: [
+          { dx: 1, dy: 0 }, // top-mid
+          { dx: 2, dy: 0 }, // top-right
+          { dx: 0, dy: 1 }, // bottom-left
+          { dx: 1, dy: 1 }, // bottom-mid
+        ],
+        // S-shape: (1,0)-(2,0), (0,1)-(1,1), (1,0)-(1,1) joiner
+        constraints: [[0,1],[2,3],[0,3]],
+        w: 3, h: 2,
+      },
+      Z: {
+        // top-left 2 cells, bottom-right 2 cells
+        cells: [[1,1,0],[0,1,1]],
+        particles: [
+          { dx: 0, dy: 0 }, // top-left
+          { dx: 1, dy: 0 }, // top-mid
+          { dx: 1, dy: 1 }, // bottom-mid
+          { dx: 2, dy: 1 }, // bottom-right
+        ],
+        // Z-shape: (0,0)-(1,0), (1,1)-(2,1), (1,0)-(1,1) joiner
+        constraints: [[0,1],[2,3],[1,2]],
+        w: 3, h: 2,
+      },
+      J: {
+        // top-left cell + bottom row full
+        cells: [[1,0,0],[1,1,1]],
+        particles: [
+          { dx: 0, dy: 0 }, // top-left (index 0)
+          { dx: 0, dy: 1 }, // bottom-left
+          { dx: 1, dy: 1 }, // bottom-mid
+          { dx: 2, dy: 1 }, // bottom-right
+        ],
+        // L-corner: top-left connects to bottom-left; bottom row connected
+        constraints: [[0,1],[1,2],[2,3]],
+        w: 3, h: 2,
+      },
+      L: {
+        // top-right cell + bottom row full
+        cells: [[0,0,1],[1,1,1]],
+        particles: [
+          { dx: 2, dy: 0 }, // top-right (index 0)
+          { dx: 0, dy: 1 }, // bottom-left
+          { dx: 1, dy: 1 }, // bottom-mid
+          { dx: 2, dy: 1 }, // bottom-right
+        ],
+        // L-corner: top-right connects to bottom-right; bottom row connected
+        constraints: [[0,3],[1,2],[2,3]],
+        w: 3, h: 2,
+      },
     };
 
     const PIECE_TYPES = ['I','O','T','S','Z','J','L'];
@@ -269,66 +375,52 @@
     // ----- State -----
     const state = {
       engine: null,
-      pieces: [],        // all live + locked pieces
-      current: null,     // active falling piece
+      pieces: [],            // all live + locked pieces
+      current: null,         // active falling piece
       bag: [],
-      queue: [],         // preview
+      queue: [],             // preview
       score: 0,
       lines: 0,
       level: 1,
       softDrop: false,
       gameOver: false,
-      // settle detection per piece
-      settleHist: new WeakMap(), // piece -> array of {t, avgSpeed}
-      velocitySamples: new WeakMap(), // piece -> circular buffer of avg speeds
-      lastTick: 0,
+      hudTimer: 0,
+      lockTimer: 0,
     };
 
-    // ----- Engine setup -----
+    // ----- Engine init -----
     function initEngine() {
       const engine = Engine.create({
-        positionIterations: 12,
-        constraintIterations: 12,
-        velocityIterations: 10,
+        positionIterations: 10,
+        constraintIterations: 6,
+        velocityIterations: 8,
       });
-      // Engine gravity disabled — we drive falling via Body.setVelocity each
-      // tick (see applyGravity below). Using engine.gravity produced pieces
-      // that hovered in place: the constraint solver kept resetting velocity
-      // to keep distances at rest length, while per-frame applyForce vanished
-      // before reaching the integrator. Direct setVelocity sidesteps both.
       engine.gravity.x = 0;
-      engine.gravity.y = 0;
+      engine.gravity.y = 0; // we drive gravity manually via setVelocity
       state.engine = engine;
 
-      // Static walls: 2 cells beyond grid border on each side, 1 cell below
-      const wallT = 20;
-      const wallH = BOARD_PX_H + 4 * CELL_SIZE + 2 * CELL_SIZE; // extra padding for visibility
+      const wallT = 24;
+      const wallH = BOARD_PX_H + 4 * CELL_SIZE;
       const wallY = BOARD_Y + BOARD_PX_H / 2;
       const left = Bodies.rectangle(
-        BOARD_X - 2 * CELL_SIZE,
+        BOARD_X - CELL_SIZE / 2 - wallT / 2,
         wallY,
-        wallT,
-        wallH,
-        { isStatic: true, label: 'wall', friction: 0.3, restitution: 0.1 }
+        wallT, wallH,
+        { isStatic: true, label: 'wall', friction: 0.2, restitution: 0.05 }
       );
       const right = Bodies.rectangle(
-        BOARD_X + BOARD_PX_W + 2 * CELL_SIZE,
+        BOARD_X + BOARD_PX_W + CELL_SIZE / 2 + wallT / 2,
         wallY,
-        wallT,
-        wallH,
-        { isStatic: true, label: 'wall', friction: 0.3, restitution: 0.1 }
+        wallT, wallH,
+        { isStatic: true, label: 'wall', friction: 0.2, restitution: 0.05 }
       );
-      // Floor: 1 cell below grid (thickened to prevent tunneling; low restitution)
       const floor = Bodies.rectangle(
         BOARD_X + BOARD_PX_W / 2,
         BOARD_Y + BOARD_PX_H + CELL_SIZE / 2,
-        BOARD_PX_W + 4 * CELL_SIZE,
+        BOARD_PX_W + 4 * CELL_SIZE + wallT * 2,
         CELL_SIZE,
         { isStatic: true, label: 'floor', friction: 0.9, restitution: 0.0 }
       );
-      // No ceiling — pieces spawn ABOVE the playfield and must fall freely
-      // into it. A ceiling body here would block the spawn path and freeze
-      // pieces at the top of the board.
       Composite.add(engine.world, [left, right, floor]);
     }
 
@@ -346,410 +438,474 @@
       return state.bag.shift();
     }
     function ensureQueue() {
-      while (state.queue.length < 3) state.queue.push(nextPieceType());
+      while (state.queue.length < 4) state.queue.push(nextPieceType());
     }
 
-    // ----- Soft-body tetromino creation -----
+    // ----- Tetromino creation -----
     function createTetromino(type, spawnX, spawnY) {
-      const bitmap = BITMAPS[type];
-      const subW = bitmap.w * 2; // sub-lattice columns (PARTICLES_PER_CELL=4 → 2x2 per cell)
-      const subH = bitmap.h * 2;
-      const colGap = CELL_SIZE / 2;
-      const rowGap = CELL_SIZE / 2;
-      const groupId = Body.nextGroup(true); // unique negative group → live particles in same piece don't collide with each other
-
+      const shape = SHAPES[type];
+      const groupId = Body.nextGroup(true);
       const composite = Composite.create({ label: type });
-      const lookup = new Map(); // 'sx,sy' → body, for constraint wiring
+      const particles = [];
 
-      // Manually build the lattice. (Avoids Composites.stack callback
-      // semantics — Math.round on (x - spawnX)/colGap was producing wrong
-      // indices under certain position combinations.)
-      for (let row = 0; row < subH; row++) {
-        for (let col = 0; col < subW; col++) {
-          const x = spawnX + col * colGap;
-          const y = spawnY + row * rowGap;
-          const cellX = Math.floor(col / 2);
-          const cellY = Math.floor(row / 2);
-          const occupied = !!(bitmap.cells[cellY] && bitmap.cells[cellY][cellX]);
-          let body;
-          if (occupied) {
-            body = Bodies.circle(x, y, PARTICLE_R, {
-              collisionFilter: { group: groupId },
-              inertia: Infinity,
-              friction: 0.1,
-              frictionStatic: 0.2,
-              restitution: 0.10,
-              frictionAir: PARTICLE_FRICTION_AIR,
-              density: 0.001,
-              label: type + '-live',
-            });
-          } else {
-            // Dead lattice particle: static, no collision — pure visual placeholder
-            body = Bodies.circle(x, y, PARTICLE_R, {
-              isStatic: true,
-              collisionFilter: { mask: 0 },
-              label: type + '-dead',
-            });
-          }
-          body.plugin = { sx: col, sy: row, occupied: occupied };
-          Composite.addBody(composite, body);
-          lookup.set(col + ',' + row, body);
-        }
+      for (let i = 0; i < shape.particles.length; i++) {
+        const p = shape.particles[i];
+        const x = spawnX + p.dx * CELL_SIZE;
+        const y = spawnY + p.dy * CELL_SIZE;
+        const body = Bodies.circle(x, y, PARTICLE_R, {
+          collisionFilter: { group: groupId },
+          inertia: Infinity,
+          friction: PARTICLE_FRICTION,
+          frictionStatic: 0.3,
+          frictionAir: PARTICLE_FRICTION_AIR,
+          restitution: PARTICLE_RESTITUTION,
+          density: PARTICLE_DENSITY,
+          label: type,
+          slop: 0.02,
+        });
+        body.plugin = { pieceIndex: i, role: 'live' };
+        Composite.addBody(composite, body);
+        particles.push(body);
       }
 
-      // Wire live↔live constraints between lattice neighbors. We add an
-      // EXTRA second pass: each live particle gets a "skip" constraint to
-      // every other live particle within cellX ± 1 / cellY ± 1 of its own
-      // cell position, so the mesh holds together even when a piece's bitmap
-      // has uneven occupancy (like L, J, S, Z where top-row sub-particles
-      // are only 2/4 wide). Without this, sparse bitmap shapes T-strands
-      // apart and the piece visually stretches across the entire board.
-      //
-      // Stiffness: 0.55 is well under Matter.js's instability ceiling (≈0.7)
-      // but rigid enough that an active piece's constraint mesh holds together
-      // during a terminal-velocity impact on the floor/stack.
-      const STIFF = 0.55;
-      const DAMP = 0.55;
-      function addConstraint(a, b, stiffness) {
-        if (!a || !b) return;
-        if (!(a.plugin && a.plugin.occupied)) return;
-        if (!(b.plugin && b.plugin.occupied)) return;
-        const dx = b.position.x - a.position.x;
-        const dy = b.position.y - a.position.y;
+      // Wire canonical constraints
+      for (const [a, b] of shape.constraints) {
+        const A = particles[a];
+        const B = particles[b];
+        const dx = B.position.x - A.position.x;
+        const dy = B.position.y - A.position.y;
         const len = Math.sqrt(dx * dx + dy * dy);
-        if (len < 0.0001) return;
-        // Skip if already very stretched (>1.5x spawn distance) to avoid
-        // creating stretched constraints during a fall.
         const c = Constraint.create({
-          bodyA: a, bodyB: b,
+          bodyA: A, bodyB: B,
           length: len,
-          stiffness: stiffness,
+          stiffness: STIFF,
           damping: DAMP,
         });
-        Composite.add(composite, c);
-      }
-      // Pass 1: adjacent lattice neighbors (right, down-right, down, down-left).
-      for (let row = 0; row < subH; row++) {
-        for (let col = 0; col < subW; col++) {
-          const here = lookup.get(col + ',' + row);
-          if (!here || !(here.plugin && here.plugin.occupied)) continue;
-          const right = lookup.get((col + 1) + ',' + row);
-          const dr = lookup.get((col + 1) + ',' + (row + 1));
-          const down = lookup.get(col + ',' + (row + 1));
-          const dl = lookup.get((col - 1) + ',' + (row + 1));
-          if (right) addConstraint(here, right, STIFF);
-          if (down)  addConstraint(here, down,  STIFF);
-          if (dr)    addConstraint(here, dr,    STIFF * 0.7);
-          if (dl)    addConstraint(here, dl,    STIFF * 0.7);
-        }
-      }
-      // Pass 2: vertical binding within the same logical cell column. For each
-      // live particle, connect to live particles in the cell directly below
-      // (within ±2 sub-cols, i.e., the same wide-cell column). This is the
-      // missing glue for L / J / S / Z top-row sparseness.
-      for (let row = 0; row < subH; row++) {
-        for (let col = 0; col < subW; col++) {
-          const here = lookup.get(col + ',' + row);
-          if (!here || !(here.plugin && here.plugin.occupied)) continue;
-          // Look 1 row down, within ±1 sub-col (i.e., other sub-particles of
-          // the same wide cell).
-          for (let dc = -1; dc <= 1; dc++) {
-            const c2 = col + dc;
-            if (c2 < 0 || c2 >= subW) continue;
-            const below = lookup.get(c2 + ',' + (row + 1));
-            if (below && below.plugin && below.plugin.occupied) {
-              addConstraint(here, below, STIFF * 0.8);
-            }
-          }
-        }
+        Composite.addConstraint(composite, c);
       }
 
-      // Add to world — Composite.add recursively flattens bodies + constraints
-      // into world.bodies and world.constraints so Engine.update simulates them.
       Composite.add(state.engine.world, composite);
 
       const piece = {
         type,
+        shape,
         composite,
         groupId,
-        bitmap,
-        cols: subW,
-        rows: subH,
+        particles,
         locked: false,
-        lockTimer: 0,
         bornAt: performance.now(),
-        settleBuffer: [],
+        restCounter: 0, // frames below LOCK_VEL_PX threshold
       };
       state.pieces.push(piece);
       return piece;
     }
 
-    // ----- Spawn / game over -----
-    function spawnCenterXFor(bitmap) {
-      return BOARD_X + (GRID_W / 2 - bitmap.w / 2) * CELL_SIZE;
-    }
+    // ----- Spawn -----
     function spawnPiece() {
       ensureQueue();
       const type = state.queue.shift();
       ensureQueue();
-      const bitmap = BITMAPS[type];
-      const spawnX = spawnCenterXFor(bitmap);
-      const spawnY = BOARD_Y - 2 * CELL_SIZE;
+      const shape = SHAPES[type];
+      // Center: align so the piece's bounding box is centered in the board.
+      const spawnX = BOARD_X + (GRID_W / 2 - shape.w / 2) * CELL_SIZE;
+      // Spawn ABOVE the board so the piece falls in.
+      const spawnY = BOARD_Y - CELL_SIZE * 1.5;
       const piece = createTetromino(type, spawnX, spawnY);
       state.current = piece;
       state.softDrop = false;
-
-      // Pre-step: run 9 frames of physics (gravity applied in main tick loop) so
-      // the piece settles into the playfield. No gravity during pre-step
-      // because per-piece gravity accumulation across pre-step iterations
-      // can compound and destabilize the constraint solver.
-      for (let i = 0; i < 9; i++) {
-        Engine.update(state.engine, 1000 / 60);
-      }
-
-      // Top-out detection: only meaningful when there's already a stack.
-      // A piece is "topped out" when, after pre-step, at least one of its
-      // live particles is still above BOARD_Y AND there's a stack particle
-      // directly below blocking descent.
-      let dead = false;
-      if (state.pieces.length > 1) {
-        const others = [];
-        for (const p of state.pieces) {
-          if (p === piece) continue;
-          if (!p.locked) continue; // only count locked stacks as blockages
-          for (const b of p.composite.bodies) {
-            if (b.plugin && b.plugin.occupied) others.push(b);
-          }
-        }
-        // Only fire top-out if the NEW piece is stuck near the TOP of the
-        // playing area (above y = 4 * CELL_SIZE) AND there's a stacker in the
-        // same column well below it. This avoids false positives from
-        // soft-body particle drift while pieces are still settling.
-        outer:
-        for (const b of piece.composite.bodies) {
-          if (!(b.plugin && b.plugin.occupied)) continue;
-          if (b.position.y > 4 * CELL_SIZE) continue; // well inside playfield — fine
-          if (b.position.y < BOARD_Y) continue; // still above board — give it time
-          for (const o of others) {
-            if (o.position.y < 8 * CELL_SIZE) continue; // stack also above playfield, skip
-            const dx = Math.abs(o.position.x - b.position.x);
-            const dy = o.position.y - b.position.y;
-            if (dx < CELL_SIZE * 0.8 && dy > 0 && dy < CELL_SIZE * 2.0) {
-              dead = true; break outer;
-            }
-          }
-        }
-      }
-      if (dead) {
-        state.gameOver = true;
-        finalScoreEl.textContent = String(state.score);
-        overlay.classList.add('on');
-      }
+      // Top-out check: if after a few frames the new piece is still jammed at
+      // the very top AND locked pieces occupy the spawn area, end the game.
+      // We delay the check so spawn jitter doesn't false-positive.
+      scheduleTopOutCheck(piece);
     }
 
-    // ----- Per-piece gravity (drive falling directly via Body.setVelocity) -----
-    // For each non-locked piece's live particles, add a small downward Δv each
-    // tick (capped at terminal velocity). Bypasses engine.gravity AND per-piece
-    // applyForce, both of which failed to make pieces fall in this setup (the
-    // constraint solver repeatedly zeroed velocity to maintain rest lengths).
-    const FALL_DV = 0.18; // Δv per tick at 60 Hz (slower fall → less impact stretch)
+    function scheduleTopOutCheck(piece) {
+      // Wait ~350 ms then check: is the piece still locked in the spawn row,
+      // AND is the spawn row actually blocked by locked particles?
+      setTimeout(() => {
+        if (state.gameOver || piece !== state.current) return;
+        // Compute the spawn-row coverage: how many of the piece's 4 particles
+        // are still in the spawn region (y < 2*CELL_SIZE)?
+        let stuckCount = 0;
+        for (const b of piece.particles) {
+          if (b.position.y < 2 * CELL_SIZE) stuckCount++;
+        }
+        if (stuckCount < 3) return; // piece is falling, no top-out
+        // Are there locked particles in the spawn row at the piece's x range?
+        const others = state.pieces.filter(p => p !== piece && p.locked);
+        let blocked = false;
+        for (const p of others) {
+          for (const b of p.particles) {
+            if (b.position.y >= 0 && b.position.y < 3 * CELL_SIZE) {
+              // Particle in the spawn region — does it overlap with this piece?
+              for (const myB of piece.particles) {
+                const dx = myB.position.x - b.position.x;
+                const dy = myB.position.y - b.position.y;
+                if (dx * dx + dy * dy < (CELL_SIZE * 0.9) * (CELL_SIZE * 0.9)) {
+                  blocked = true; break;
+                }
+              }
+              if (blocked) break;
+            }
+          }
+          if (blocked) break;
+        }
+        if (blocked) endGame();
+      }, 350);
+    }
+
+    function endGame() {
+      state.gameOver = true;
+      finalScoreEl.textContent = String(state.score);
+      overlay.classList.add('on');
+    }
+
+    // ----- Per-piece gravity (drive falling directly) -----
     function applyGravity() {
-      const dv = FALL_DV * (state.softDrop ? 3 : 1);
-      const vMax = MAX_PARTICLE_VY;
-      const vxMax = vMax * 1.4;
+      const softDrop = state.softDrop;
+      const dv = FALL_DV * (softDrop ? SOFT_DROP_MULT : 1);
+      const vyCap = softDrop ? MAX_VY_SOFT : MAX_VY;
       for (const piece of state.pieces) {
         if (piece.locked) continue;
-        for (const b of piece.composite.bodies) {
-          if (!(b.label && b.label.endsWith('-live'))) continue;
+        for (const b of piece.particles) {
           const v = b.velocity;
-          // Add falling Δv while respecting cap. Also enforce horizontal cap.
-          let nx = v.x, ny = v.y + dv;
-          if (ny > vMax) ny = vMax;
-          else if (ny < -vMax) ny = -vMax;
-          if (nx > vxMax) nx = vxMax;
-          else if (nx < -vxMax) nx = -vxMax;
+          let ny = v.y + dv;
+          if (ny > vyCap) ny = vyCap;
+          if (ny < -vyCap) ny = -vyCap;
+          let nx = v.x;
+          if (nx > MAX_VX) nx = MAX_VX;
+          if (nx < -MAX_VX) nx = -MAX_VX;
           Body.setVelocity(b, { x: nx, y: ny });
         }
       }
     }
-    function updateEngineGravity() { /* no-op; applyGravity handles fall */ }
-    // Velocity clamp kept as safety for input-driven horizontal motion.
-    function clampAllVelocities() {
-      const vMax = MAX_PARTICLE_VY;
-      const vxMax = vMax * 1.4;
-      for (const piece of state.pieces) {
-        for (const b of piece.composite.bodies) {
-          if (!(b.label && b.label.endsWith('-live'))) continue;
-          const v = b.velocity;
-          if (v.y > vMax) Body.setVelocity(b, { x: v.x, y: vMax });
-          else if (v.y < -vMax) Body.setVelocity(b, { x: v.x, y: -vMax });
-          if (v.x > vxMax) Body.setVelocity(b, { x: vxMax, y: v.y });
-          else if (v.x < -vxMax) Body.setVelocity(b, { x: -vxMax, y: v.y });
-        }
-      }
-    }
 
-    // ----- Settle detection -----
-    function pieceAverageSpeed(piece) {
-      let sum = 0, n = 0;
-      for (const b of piece.composite.bodies) {
-        if (b.label && b.label.endsWith('-live')) {
-          const v = b.velocity;
-          sum += Math.sqrt(v.x * v.x + v.y * v.y);
-          n++;
-        }
-      }
-      return n > 0 ? sum / n : 0;
-    }
+    // ----- Settle / lock detection -----
     function pieceMaxY(piece) {
       let m = -Infinity;
-      for (const b of piece.composite.bodies) {
-        if (b.label && b.label.endsWith('-live')) {
-          if (b.position.y > m) m = b.position.y;
-        }
+      for (const b of piece.particles) {
+        if (b.position.y > m) m = b.position.y;
       }
       return m;
     }
-    function updateSettle(piece) {
-      const speed = pieceAverageSpeed(piece);
-      const maxY = pieceMaxY(piece);
-      const now = performance.now();
-      if (piece._maxYPrev === undefined || maxY > piece._maxYPrev + 0.05) {
-        piece._maxYPrev = maxY;
-        piece._maxYStableSince = now;
+    function pieceAvgSpeed(piece) {
+      let sum = 0;
+      for (const b of piece.particles) {
+        const v = b.velocity;
+        sum += Math.sqrt(v.x * v.x + v.y * v.y);
       }
-      piece._lastSpeed = speed;
+      return sum / piece.particles.length;
     }
-    function isSettled(piece) {
-      // Don't settle for the first 800 ms — give the piece time to fall.
-      if (performance.now() - piece.bornAt < 800) return false;
-      const maxY = piece._maxYPrev !== undefined ? piece._maxYPrev : -Infinity;
-      const onFloorOrStack = maxY > BOARD_PX_H - 2 * CELL_SIZE;
-      const inPlayfield = maxY > 9 * CELL_SIZE;
-      // Hard timeout: if the piece has been alive for 2.5 s, force-lock it.
-      // Without this, pieces that oscillate > 2 px/step on the floor never
-      // settle — they remain "active" forever, dragging extra weight onto
-      // their constraint mesh and stretching it via frictionAir wobble.
-      if (performance.now() - piece.bornAt > 2500) return true;
-      // Standard settle (require stillness) — softened from speed < 2 → < 3
-      // because pieces resting on uneven stacks often bounce at 2-3 px/step.
-      if (piece._maxYStableSince === undefined) return false;
-      const stableMs = performance.now() - piece._maxYStableSince;
-      const settled = stableMs > 250 && piece._lastSpeed < 3.0;
-      // Either standard stability OR (hard floor contact + at least briefly stable)
-      return settled || (onFloorOrStack && stableMs > 100);
+    function pieceFullyOnFloorOrStack(piece) {
+      // True if every particle has at least one contact point below it
+      // (floor or another locked piece). We approximate by checking each
+      // particle's bottom against the floor, OR a downward overlap with
+      // any locked piece.
+      const others = state.pieces.filter(p => p !== piece && p.locked);
+      for (const b of piece.particles) {
+        // Floor check
+        if (b.position.y + PARTICLE_R < BOARD_PX_H - 0.5) {
+          // Not on the floor itself — check stacked bodies
+          let onStack = false;
+          for (const p of others) {
+            for (const o of p.particles) {
+              const dx = Math.abs(b.position.x - o.position.x);
+              const dy = o.position.y - b.position.y;
+              if (dx < CELL_SIZE * 0.85 && dy > 0 && dy < PARTICLE_R * 2.4) {
+                onStack = true; break;
+              }
+            }
+            if (onStack) break;
+          }
+          if (!onStack) return false;
+        }
+      }
+      return true;
     }
-
-    // ----- Lock piece -----
+    function tryLockPiece(piece) {
+      if (piece.locked) return;
+      const speed = pieceAvgSpeed(piece);
+      const onSurface = pieceFullyOnFloorOrStack(piece);
+      const alive = performance.now() - piece.bornAt;
+      if (onSurface && speed < LOCK_VEL_PX) {
+        piece.restCounter++;
+      } else {
+        piece.restCounter = 0;
+      }
+      const shouldLock = piece.restCounter >= LOCK_FRAMES || alive > HARD_LOCK_MS;
+      if (shouldLock) lockPiece(piece);
+    }
     function lockPiece(piece) {
       if (piece.locked) return;
       piece.locked = true;
-      // Production-proven soft-body lock pattern (Matter.js): freeze each
-      // particle via Sleeping + isStatic so the engine skips integration
-      // for locked bodies. Static bodies STILL collide with dynamic ones
-      // (that's how walls work in Matter.js), so incoming pieces pile on
-      // top exactly like in standard Tetris — without dragging the locked
-      // mesh apart via impact-induced constraint drift over time.
-      for (const b of piece.composite.bodies) {
-        if (b.label && b.label.endsWith('-live')) {
-          Body.setVelocity(b, { x: 0, y: 0 });
-          Body.setAngularVelocity(b, 0);
-          // isStatic + Sleeping is belt-and-suspenders: either alone works,
-          // but together they guarantee no position change no matter what.
-          b.isStatic = true;
-          Sleeping.set(b, true);
+      // Freeze each particle. Static + Sleeping guarantees no integration
+      // happens, AND static bodies still collide with dynamic ones (so
+      // pieces pile on normally — exactly the same mechanism as walls).
+      for (const b of piece.particles) {
+        Body.setVelocity(b, { x: 0, y: 0 });
+        Body.setAngularVelocity(b, 0);
+        b.isStatic = true;
+        Sleeping.set(b, true);
+      }
+      if (state.current === piece) state.current = null;
+      // Top-out detection: if this piece locked with most of its particles
+      // still in the spawn row AND there are locked particles overlapping
+      // that spawn region, the column is full — game over.
+      let maxY = -Infinity, stuckInSpawn = 0;
+      for (const b of piece.particles) {
+        if (b.position.y > maxY) maxY = b.position.y;
+        if (b.position.y < 2 * CELL_SIZE) stuckInSpawn++;
+      }
+      if (!state.gameOver && stuckInSpawn >= 3 && state.pieces.length > 1) {
+        let blockedInSpawn = false;
+        for (const p of state.pieces) {
+          if (p === piece) continue;
+          for (const b of p.particles) {
+            if (b.position.y >= 0 && b.position.y < 3 * CELL_SIZE) {
+              for (const myB of piece.particles) {
+                const dx = myB.position.x - b.position.x;
+                const dy = myB.position.y - b.position.y;
+                if (dx * dx + dy * dy < (CELL_SIZE * 0.9) * (CELL_SIZE * 0.9)) {
+                  blockedInSpawn = true; break;
+                }
+              }
+              if (blockedInSpawn) break;
+            }
+          }
+          if (blockedInSpawn) break;
+        }
+        if (blockedInSpawn) {
+          endGame();
+          return;
         }
       }
-      // Give current = null only if it's the active piece
-      if (state.current === piece) state.current = null;
-      // After a tiny delay, detect cleared rows
-      setTimeout(detectAndClearRows, 50);
+      // Detect cleared rows after a brief breath
+      setTimeout(detectAndClearRows, 60);
+      // Spawn the next piece (we're not the active piece anymore)
+      setTimeout(() => {
+        if (!state.gameOver && !state.current) spawnPiece();
+      }, 90);
     }
 
     // ----- Line clear -----
     function detectAndClearRows() {
+      if (state.gameOver) return;
+      // Count particles in each row. Row r covers y in [r*CELL_SIZE, (r+1)*CELL_SIZE).
+      const counts = new Array(GRID_H).fill(0);
+      for (const p of state.pieces) {
+        for (const b of p.particles) {
+          const row = Math.floor(b.position.y / CELL_SIZE);
+          if (row >= 0 && row < GRID_H) counts[row]++;
+        }
+      }
       const full = [];
       for (let row = 0; row < GRID_H; row++) {
-        const yMin = row * CELL_SIZE - ROW_HALF;
-        const yMax = (row + 1) * CELL_SIZE + ROW_HALF;
-        let count = 0;
-        for (const p of state.pieces) {
-          for (const body of p.composite.bodies) {
-            if (body.label && body.label.endsWith('-live') &&
-                body.position.y >= yMin && body.position.y < yMax) {
-              count++;
-            }
-          }
-        }
-        if (count >= GRID_W * PARTICLES_PER_CELL * 0.6) full.push(row);
+        // A row is full when at least GRID_W particles occupy it. We allow
+        // a 1-particle slack to absorb small soft-body drift.
+        if (counts[row] >= GRID_W) full.push(row);
       }
       if (full.length === 0) return;
-      // Defensive cap: theoretical Tetris max is 4 rows per drop. Beyond that,
-      // it means stretched particles have over-counted; bound to [0..4] so
-      // table[full.length] can't become undefined and corrupt state.score.
+      // Cap at 4 (theoretical Tetris max) — defensive against any stretched
+      // soft-body counting regression.
       if (full.length > 4) full.length = 4;
-      // Mark particles for removal
+
+      // Identify particles to remove
       const toRemove = [];
       for (const p of state.pieces) {
-        const liveBodies = [];
-        for (const body of p.composite.bodies) {
-          if (!(body.label && body.label.endsWith('-live'))) continue;
-          const yMid = body.position.y;
-          let inCleared = false;
-          for (const row of full) {
-            const yMin = row * CELL_SIZE - ROW_HALF;
-            const yMax = (row + 1) * CELL_SIZE + ROW_HALF;
-            if (yMid >= yMin && yMid < yMax) { inCleared = true; break; }
-          }
-          if (inCleared) toRemove.push(body);
-          else liveBodies.push(body);
-        }
-        // Store remaining live count for post-clear settle
-        p.remainingLive = liveBodies.length;
-      }
-      // Remove constraints referencing those bodies, then bodies
-      const allConstraints = Composite.allConstraints(state.engine.world);
-      for (const c of allConstraints) {
-        if ((c.bodyA && toRemove.includes(c.bodyA)) ||
-            (c.bodyB && toRemove.includes(c.bodyB))) {
-          Composite.remove(state.engine.world, c);
-        }
-      }
-      for (const b of toRemove) Composite.remove(state.engine.world, b);
-
-      // Drop pieces whose composite is now empty
-      state.pieces = state.pieces.filter(p => {
-        let any = false;
-        for (const b of p.composite.bodies) {
-          if (b.label && b.label.endsWith('-live')) { any = true; break; }
-        }
-        return any;
-      });
-
-      // Apply a small downward impulse to pieces above cleared rows to settle them
-      const minClearedY = Math.min(...full) * CELL_SIZE;
-      for (const p of state.pieces) {
-        for (const b of p.composite.bodies) {
-          if (b.label && b.label.endsWith('-live') && b.position.y < minClearedY) {
-            Body.setVelocity(b, { x: b.velocity.x, y: 2 });
+        for (const b of p.particles) {
+          const row = Math.floor(b.position.y / CELL_SIZE);
+          if (full.indexOf(row) !== -1) {
+            toRemove.push({ piece: p, body: b });
           }
         }
+        // Particles above cleared rows: leave alone, they fall onto the
+        // new lower surface via gravity + collisions naturally.
       }
+
+      // Remove constraints referencing removed bodies, then bodies. Use
+      // Composite.allConstraints once and skip any whose bodyA/bodyB no
+      // longer exists in the world (defensive against stale references).
+      const allCons = Composite.allConstraints(state.engine.world);
+      for (const c of allCons) {
+        if (!c || !c.parent) continue;
+        const removeA = c.bodyA && toRemove.some(r => r.body === c.bodyA);
+        const removeB = c.bodyB && toRemove.some(r => r.body === c.bodyB);
+        if (removeA || removeB) {
+          try {
+            Composite.remove(state.engine.world, c);
+          } catch (e) { /* stale constraint, ignore */ }
+        }
+      }
+      for (const r of toRemove) {
+        if (!r.body || !r.body.parent) continue;
+        try {
+          Composite.remove(r.piece.composite, r.body);
+        } catch (e) { /* stale body, ignore */ }
+        const idx = r.piece.particles.indexOf(r.body);
+        if (idx !== -1) r.piece.particles.splice(idx, 1);
+      }
+      // Drop pieces that have lost all particles
+      state.pieces = state.pieces.filter(p => p.particles.length > 0);
 
       // Score (standard Tetris)
       const table = [0, 100, 300, 500, 800];
-      state.score += table[full.length] * state.level;
-      state.lines += full.length;
+      const cleared = full.length;
+      state.score += table[cleared] * state.level;
+      state.lines += cleared;
       state.level = Math.min(20, 1 + Math.floor(state.lines / 10));
-
-      // Spawn next piece after a tiny breath
-      setTimeout(() => {
-        if (!state.gameOver) spawnPiece();
-      }, 120);
     }
 
-    // ----- Input -----
-    const keyState = { left: false, right: false, softDrop: false };
+    // ----- Input handling -----
+    // Movement: snap-translate by exactly 1 cell. After Composite.translate,
+    // all particles moved by the same delta so constraints remain at rest
+    // length (no solver interference). The pre-check rejects the move if it
+    // would clip walls or overlap locked particles.
+    function moveHorizontal(dir) {
+      const piece = state.current;
+      if (!piece || piece.locked) return;
+      const dx = dir * CELL_SIZE;
+      const wallLeft = BOARD_X + PARTICLE_R;
+      const wallRight = BOARD_X + BOARD_PX_W - PARTICLE_R;
+      // Wall bounds check
+      for (const b of piece.particles) {
+        const nx = b.position.x + dx;
+        if (nx < wallLeft || nx > wallRight) return;
+      }
+      // Overlap check against locked pieces
+      for (const b of piece.particles) {
+        for (const p of state.pieces) {
+          if (p === piece) continue;
+          if (!p.locked) continue;
+          for (const o of p.particles) {
+            const ddx = (b.position.x + dx) - o.position.x;
+            const ddy = b.position.y - o.position.y;
+            const rsum = CELL_SIZE * 0.9;
+            if (ddx * ddx + ddy * ddy < rsum * rsum) return;
+          }
+        }
+      }
+      // Translate. setPosition preserves constraint lengths (all particles
+      // moved by same delta), and we explicitly zero velocity so the piece
+      // doesn't keep gliding after the keypress.
+      for (const b of piece.particles) {
+        Body.setPosition(b, { x: b.position.x + dx, y: b.position.y });
+        Body.setVelocity(b, { x: 0, y: b.velocity.y });
+      }
+    }
+    function rotateCurrent() {
+      const piece = state.current;
+      if (!piece || piece.locked) return;
+      if (piece.type === 'O') return; // O is symmetric
+      // Compute centroid of the piece
+      let sx = 0, sy = 0, n = 0;
+      for (const b of piece.particles) {
+        sx += b.position.x; sy += b.position.y; n++;
+      }
+      const cx = sx / n, cy = sy / n;
+      // Snapshot positions and constraint connections
+      const snap = piece.particles.map(b => ({ x: b.position.x, y: b.position.y }));
+      // Rotate each particle 90° around the centroid
+      for (const b of piece.particles) {
+        const dx = b.position.x - cx;
+        const dy = b.position.y - cy;
+        Body.setPosition(b, { x: cx - dy, y: cy + dx });
+      }
+      // Rebuild constraint lengths so they don't snap
+      const cons = Composite.allConstraints(piece.composite);
+      for (const c of cons) {
+        const A = c.bodyA, B = c.bodyB;
+        const dx = B.position.x - A.position.x;
+        const dy = B.position.y - A.position.y;
+        c.length = Math.sqrt(dx * dx + dy * dy);
+      }
+      // Wall kick / undo: if any particle is now outside the walls or below
+      // the floor, restore snapshot.
+      const wallLeft = BOARD_X + PARTICLE_R;
+      const wallRight = BOARD_X + BOARD_PX_W - PARTICLE_R;
+      const floorY = BOARD_Y + BOARD_PX_H - PARTICLE_R;
+      let clipped = false;
+      for (const b of piece.particles) {
+        if (b.position.x < wallLeft || b.position.x > wallRight ||
+            b.position.y > floorY) {
+          clipped = true; break;
+        }
+      }
+      if (clipped) {
+        // Wall kick: try shifting horizontally by 1 cell before giving up
+        let kicked = false;
+        for (const shift of [-CELL_SIZE, CELL_SIZE, -2 * CELL_SIZE, 2 * CELL_SIZE]) {
+          for (const b of piece.particles) {
+            Body.setPosition(b, { x: snap[b.plugin.pieceIndex].x + shift, y: snap[b.plugin.pieceIndex].y });
+          }
+          let stillClipped = false;
+          for (const b of piece.particles) {
+            if (b.position.x < wallLeft || b.position.x > wallRight ||
+                b.position.y > floorY) { stillClipped = true; break; }
+          }
+          if (!stillClipped) { kicked = true; break; }
+        }
+        if (!kicked) {
+          // Restore snapshot
+          for (let i = 0; i < piece.particles.length; i++) {
+            Body.setPosition(piece.particles[i], { x: snap[i].x, y: snap[i].y });
+          }
+          for (const c of cons) {
+            const A = c.bodyA, B = c.bodyB;
+            const dx = B.position.x - A.position.x;
+            const dy = B.position.y - A.position.y;
+            c.length = Math.sqrt(dx * dx + dy * dy);
+          }
+        }
+      }
+    }
+    function hardDrop() {
+      const piece = state.current;
+      if (!piece || piece.locked) return;
+      const step = CELL_SIZE * 0.25;
+      const maxSteps = GRID_H * 6;
+      const floorLimit = BOARD_PX_H - PARTICLE_R;
+      const wallLeft = BOARD_X + PARTICLE_R;
+      const wallRight = BOARD_X + BOARD_PX_W - PARTICLE_R;
+      // Build blocker list: locked pieces' particles only (walls checked directly)
+      const others = state.pieces.filter(p => p !== piece && p.locked);
+      const blockers = [];
+      for (const p of others) for (const b of p.particles) blockers.push(b);
+      let stepped = 0;
+      for (let i = 1; i <= maxSteps; i++) {
+        let conflict = false;
+        for (const b of piece.particles) {
+          const nx = b.position.x;
+          const ny = b.position.y + step;
+          // Wall check (x bounds)
+          if (nx - PARTICLE_R < wallLeft || nx + PARTICLE_R > wallRight) {
+            conflict = true; break;
+          }
+          // Floor check
+          if (ny + PARTICLE_R > floorLimit) { conflict = true; break; }
+          // Blocker (locked particle) check
+          for (const ob of blockers) {
+            const dx = nx - ob.position.x;
+            const dy = ny - ob.position.y;
+            const rsum = PARTICLE_R * 2 * 0.92;
+            if (dx * dx + dy * dy < rsum * rsum) { conflict = true; break; }
+          }
+          if (conflict) break;
+        }
+        if (conflict) break;
+        for (const b of piece.particles) {
+          Body.setPosition(b, { x: b.position.x, y: b.position.y + step });
+        }
+        stepped = i;
+      }
+      // If the piece didn't move at all (conflict on the very first step),
+      // the spawn column is blocked — this is top-out, end the game.
+      if (stepped === 0) {
+        endGame();
+        return;
+      }
+      // Lock immediately
+      lockPiece(piece);
+    }
 
     function onKeyDown(e) {
       if (state.gameOver) {
@@ -759,11 +915,11 @@
       if (!state.current) return;
       switch (e.key) {
         case 'ArrowLeft':
-          moveHorizontal(-3);
+          moveHorizontal(-1);
           e.preventDefault();
           break;
         case 'ArrowRight':
-          moveHorizontal(+3);
+          moveHorizontal(+1);
           e.preventDefault();
           break;
         case 'ArrowDown':
@@ -790,208 +946,42 @@
     function onKeyUp(e) {
       if (e.key === 'ArrowDown') state.softDrop = false;
     }
-    function moveHorizontal(dx) {
-      if (!state.current || state.current.locked) return;
-      // Translate the whole composite by exactly 1 cell (snap). With soft-body
-      // pieces, individual particle velocity isn't enough to move them
-      // visibly within reasonable input cadence — use Composite.translate so
-      // the displacement is deterministic and collision-driven.
-      const step = CELL_SIZE;
-      const tryX = state.current.composite.bodies[0].position.x + dx;
-      // Quick bounds check: live particles must remain within walls.
-      const wallLeft = BOARD_X - CELL_SIZE * 0.3;
-      const wallRight = BOARD_X + BOARD_PX_W + CELL_SIZE * 0.3;
-      let blocked = false;
-      for (const b of state.current.composite.bodies) {
-        if (!(b.label && b.label.endsWith('-live'))) continue;
-        if (b.position.x + dx < wallLeft) blocked = true;
-        if (b.position.x + dx > wallRight) blocked = true;
-      }
-      if (blocked) return;
-      // Move the composite, then check for overlap with locked pieces.
-      Composite.translate(state.current.composite, { x: dx, y: 0 });
-      // Overlap check against locked-piece live particles.
-      const movers = state.current.composite.bodies.filter(
-        b => b.label && b.label.endsWith('-live')
-      );
-      outer:
-      for (const m of movers) {
-        for (const p of state.pieces) {
-          if (p === state.current) continue;
-          if (!p.locked) continue;
-          for (const o of p.composite.bodies) {
-            if (!(o.label && o.label.endsWith('-live'))) continue;
-            const ddx = m.position.x - o.position.x;
-            const ddy = m.position.y - o.position.y;
-            const rsum = PARTICLE_R * 2 * 1.2;
-            if (ddx * ddx + ddy * ddy < rsum * rsum) {
-              blocked = true;
-              break outer;
-            }
-          }
-        }
-      }
-      if (blocked) {
-        // Revert
-        Composite.translate(state.current.composite, { x: -dx, y: 0 });
-      }
-    }
-    function rotateCurrent() {
-      const piece = state.current;
-      if (!piece || piece.locked) return;
-      // Compute centroid of live particles
-      let sx = 0, sy = 0, n = 0;
-      for (const b of piece.composite.bodies) {
-        if (b.label && b.label.endsWith('-live')) {
-          sx += b.position.x; sy += b.position.y; n++;
-        }
-      }
-      if (n === 0) return;
-      const cx = sx / n, cy = sy / n;
-      // Snapshot positions to detect wall clip after rotate
-      const snapshot = piece.composite.bodies.map(b => ({
-        b, x: b.position.x, y: b.position.y,
-      }));
-      Composite.rotate(piece.composite, Math.PI / 2, { x: cx, y: cy });
-      // If any live body would now be outside walls or below floor, undo
-      const wallLeft = BOARD_X - CELL_SIZE;
-      const wallRight = BOARD_X + BOARD_PX_W + CELL_SIZE;
-      const floorY = BOARD_Y + BOARD_PX_H + CELL_SIZE * 0.5;
-      let clipped = false;
-      for (const b of piece.composite.bodies) {
-        if (!(b.label && b.label.endsWith('-live'))) continue;
-        if (b.position.x < wallLeft || b.position.x > wallRight || b.position.y > floorY) {
-          clipped = true; break;
-        }
-      }
-      if (clipped) {
-        // Undo: restore positions
-        for (const s of snapshot) {
-          Body.setPosition(s.b, { x: s.x, y: s.y });
-        }
-      }
-    }
-    function hardDrop() {
-      const piece = state.current;
-      if (!piece || piece.locked) return;
-      const step = CELL_SIZE * 0.5;
-      const maxSteps = GRID_H * 4; // safety cap
-      const floorY = BOARD_Y + BOARD_PX_H; // particles rest with center at floorY - PARTICLE_R
-      // Collect all "blocking" bodies: walls, floor, and live particles of other pieces
-      const blockers = [];
-      const all = Composite.allBodies(state.engine.world);
-      for (const ob of all) {
-        if (ob === piece) continue;
-        const lbl = ob.label || '';
-        if (lbl === 'wall' || lbl === 'floor') blockers.push(ob);
-        else if (lbl.endsWith('-live')) blockers.push(ob);
-      }
-      let stepped = 0;
-      for (let i = 1; i <= maxSteps; i++) {
-        let conflict = false;
-        for (const b of piece.composite.bodies) {
-          if (!(b.label && b.label.endsWith('-live'))) continue;
-          const nx = b.position.x;
-          const ny = b.position.y + step;
-          for (const ob of blockers) {
-            const lbl = ob.label || '';
-            if (lbl === 'floor') {
-              // Floor top is at BOARD_Y + BOARD_PX_H (extending CELL_SIZE thick).
-              if (ny + PARTICLE_R > BOARD_Y + BOARD_PX_H) { conflict = true; break; }
-            } else if (lbl === 'wall') {
-              // Side walls are 2 cells beyond board edges — check if next X crosses them.
-              const wx = ob.position.x;
-              const halfW = (ob.bounds.max.x - ob.bounds.min.x) * 0.5;
-              const leftWallX = wx - halfW;
-              const rightWallX = wx + halfW;
-              if (nx - PARTICLE_R < leftWallX) { conflict = true; break; }
-              if (nx + PARTICLE_R > rightWallX) { conflict = true; break; }
-            } else {
-              // Live particle of another piece
-              const dx = nx - ob.position.x;
-              const dy = ny - ob.position.y;
-              const rsum = PARTICLE_R * 2;
-              if (dx * dx + dy * dy < rsum * rsum * 0.85) { conflict = true; break; }
-            }
-          }
-          if (conflict) break;
-        }
-        if (conflict) break;
-        // Commit step
-        for (const b of piece.composite.bodies) {
-          if (b.label && b.label.endsWith('-live')) {
-            Body.setPosition(b, { x: b.position.x, y: b.position.y + step });
-          }
-        }
-        stepped = i;
-      }
-      // Lock immediately at the last safe position
-      lockPiece(piece);
-      setTimeout(() => {
-        if (!state.gameOver && !state.current) spawnPiece();
-      }, 80);
-    }
 
-    // ----- Tick / main loop -----
+    // ----- Tick loop -----
     let lastFrame = performance.now();
-    let hudTimer = 0;
-
     function tick(now) {
       const dt = Math.min(33, now - lastFrame);
       lastFrame = now;
 
       if (!state.gameOver) {
-        updateEngineGravity();
         Engine.update(state.engine, 1000 / 60);
-        clampAllVelocities();
         applyGravity();
 
-        // Safety clamp: if any live particle somehow escaped the playfield
-        // (tunneling after high-velocity hit), snap it back inside. Without
-        // this, a single tunneling cascade drags the whole mesh below the
-        // floor and the piece "explodes" to y = 500,000+.
-        const safeMinX = BOARD_X - CELL_SIZE * 0.5;
-        const safeMaxX = BOARD_X + BOARD_PX_W + CELL_SIZE * 0.5;
-        const safeMaxY = BOARD_Y + BOARD_PX_H + CELL_SIZE * 0.0;
+        // Safety: clamp runaway velocities & pull back escapees. Soft drop
+        // uses a higher cap, so honor whichever is in effect.
+        const safetyVyCap = (state.softDrop ? MAX_VY_SOFT : MAX_VY) * 1.5;
         for (const piece of state.pieces) {
-          for (const b of piece.composite.bodies) {
-            if (!(b.label && b.label.endsWith('-live'))) continue;
-            const p = b.position;
-            if (p.x < safeMinX) Body.setPosition(b, { x: safeMinX, y: p.y });
-            else if (p.x > safeMaxX) Body.setPosition(b, { x: safeMaxX, y: p.y });
-            if (p.y > safeMaxY) {
-              Body.setPosition(b, { x: p.x, y: safeMaxY });
-              Body.setVelocity(b, { x: b.velocity.x, y: 0 });
+          for (const b of piece.particles) {
+            const v = b.velocity;
+            if (v.y > safetyVyCap) Body.setVelocity(b, { x: v.x, y: safetyVyCap });
+            if (v.x > MAX_VX * 1.5) Body.setVelocity(b, { x: MAX_VX * 1.5, y: v.y });
+            if (v.x < -MAX_VX * 1.5) Body.setVelocity(b, { x: -MAX_VX * 1.5, y: v.y });
+            // Pull back wall escapees
+            if (b.position.x < BOARD_X - CELL_SIZE) {
+              Body.setPosition(b, { x: BOARD_X + PARTICLE_R, y: b.position.y });
+            }
+            if (b.position.x > BOARD_X + BOARD_PX_W + CELL_SIZE) {
+              Body.setPosition(b, { x: BOARD_X + BOARD_PX_W - PARTICLE_R, y: b.position.y });
             }
           }
         }
 
-        // Settle detection. We iterate EVERY non-locked piece — not just
-        // state.current — because a piece that wasn't active when the
-        // previous lock fired can be left dangling forever otherwise (it
-        // never gets isSettled called again, so its particles keep moving
-        // and stretch the constraint mesh). When a piece is ready we lock
-        // it; only if state.current is the one we just locked do we queue
-        // a spawn for the next.
-        let nextShouldSpawn = false;
+        // Settle detection — iterate ALL unlocked pieces
         for (const p of state.pieces) {
           if (p.locked) continue;
-          updateSettle(p);
-          if (isSettled(p)) {
-            const wasCurrent = (state.current === p);
-            lockPiece(p);
-            if (wasCurrent) nextShouldSpawn = true;
+          if (performance.now() - p.bornAt > 250) {
+            tryLockPiece(p);
           }
-        }
-        if (nextShouldSpawn) {
-          setTimeout(() => {
-            if (!state.gameOver && !state.current) spawnPiece();
-          }, 60);
-        }
-
-        // Settle update for all locked pieces too (for wobbly rest state)
-        for (const p of state.pieces) {
-          if (p.locked) updateSettle(p);
         }
       }
 
@@ -1001,7 +991,7 @@
 
     // ----- Renderer -----
     function drawGrid() {
-      ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+      ctx.strokeStyle = 'rgba(255,255,255,0.04)';
       ctx.lineWidth = 1;
       ctx.beginPath();
       for (let x = 0; x <= GRID_W; x++) {
@@ -1018,125 +1008,106 @@
     }
 
     function drawWalls() {
-      // Walls/floor: iterate world bodies with label 'wall' or 'floor'
       const bodies = Composite.allBodies(state.engine.world);
       ctx.fillStyle = '#1a1a2e';
+      ctx.strokeStyle = '#2a2a4a';
+      ctx.lineWidth = 1;
       for (const b of bodies) {
         if (b.label === 'wall' || b.label === 'floor') {
-          // Skip the ceiling (above the board)
-          if (b.label === 'wall' && b.bounds.max.y < BOARD_Y) continue;
           const verts = b.vertices;
           ctx.beginPath();
           ctx.moveTo(verts[0].x, verts[0].y);
           for (let i = 1; i < verts.length; i++) ctx.lineTo(verts[i].x, verts[i].y);
           ctx.closePath();
           ctx.fill();
+          ctx.stroke();
         }
       }
     }
 
-    function drawPieceMesh(piece) {
+    // Render a soft-body piece:
+    // 1. For each canonical constraint, draw a thick rounded lozenge
+    //    connecting the two particle centers. This is the "skin" of the
+    //    jelly — when particles wobble, the lozenges stretch/compress.
+    // 2. Draw filled circles at each particle.
+    function drawPiece(piece) {
       const color = COLORS[piece.type];
-      // Build lattice lookup: sx,sy -> body
+
+      // Build particle lookup by piece index
       const idxAt = new Map();
-      for (const b of piece.composite.bodies) {
-        if (!b.plugin) continue;
-        idxAt.set(b.plugin.sx + ',' + b.plugin.sy, b);
-      }
-      const cols = piece.cols, rows = piece.rows;
-      // Walk every 2x2 sub-grid cell and draw 2 triangles per quad
-      for (let y = 0; y < rows - 1; y++) {
-        for (let x = 0; x < cols - 1; x++) {
-          const a = idxAt.get(x + ',' + y);
-          const c = idxAt.get((x + 1) + ',' + y);
-          const b2 = idxAt.get(x + ',' + (y + 1));
-          const d = idxAt.get((x + 1) + ',' + (y + 1));
-          if (!a || !c || !b2 || !d) continue;
-          // Only fill if at least one of the four is "live" (occupied)
-          // — this keeps dead-lattice corners from leaking the fill.
-          const anyLive = (a.plugin.occupied || c.plugin.occupied ||
-                           b2.plugin.occupied || d.plugin.occupied);
-          if (!anyLive) continue;
-          // For visually pleasing fill, skip quads whose all 4 corners are dead
-          // but at least one is live — we'd rather not show awkward gaps. Instead,
-          // require the quad to be "mostly live": at least 2 live corners.
-          let liveCount = 0;
-          if (a.plugin.occupied) liveCount++;
-          if (c.plugin.occupied) liveCount++;
-          if (b2.plugin.occupied) liveCount++;
-          if (d.plugin.occupied) liveCount++;
-          if (liveCount < 2) continue;
+      for (const b of piece.particles) idxAt.set(b.plugin.pieceIndex, b);
 
-          ctx.fillStyle = color + '99';
-          ctx.strokeStyle = color;
-          ctx.lineWidth = 1.5;
-
-          // Guard against "constraint explosion" rendering: when a piece's
-          // particles drifted apart mid-fall before lock, the renderer still
-          // connects adjacent sub-lattice indices. That makes a single quad
-          // span hundreds of pixels, painting vertical streaks. Skip any
-          // quad whose four corners cover more than 3 cells in either axis.
-          const dxQuad = Math.max(
-            Math.abs(a.position.x - d.position.x),
-            Math.abs(c.position.x - b2.position.x)
-          );
-          const dyQuad = Math.max(
-            Math.abs(a.position.y - b2.position.y),
-            Math.abs(c.position.y - d.position.y)
-          );
-          if (dxQuad > 3.5 * CELL_SIZE || dyQuad > 3.5 * CELL_SIZE) continue;
-
-          // Two triangles: (a,c,b2) and (c,d,b2)
-          ctx.beginPath();
-          ctx.moveTo(a.position.x, a.position.y);
-          ctx.lineTo(c.position.x, c.position.y);
-          ctx.lineTo(b2.position.x, b2.position.y);
-          ctx.closePath();
-          ctx.fill();
-          ctx.stroke();
-
-          ctx.beginPath();
-          ctx.moveTo(c.position.x, c.position.y);
-          ctx.lineTo(d.position.x, d.position.y);
-          ctx.lineTo(b2.position.x, b2.position.y);
-          ctx.closePath();
-          ctx.fill();
-          ctx.stroke();
-        }
-      }
-
-      // Particle dots (live only)
-      ctx.fillStyle = color;
-      for (const b of piece.composite.bodies) {
-        if (!(b.label && b.label.endsWith('-live'))) continue;
+      // Draw lozenges for each constraint. We use a thick rounded line — the
+      // lineCap='round' ends meet the circle fills seamlessly. Width is
+      // sized so two adjacent particles overlap visually into one blob when
+      // they're at rest distance.
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      for (const [a, b] of piece.shape.constraints) {
+        const A = idxAt.get(a);
+        const B = idxAt.get(b);
+        if (!A || !B) continue;
+        // Width scales with distance — when compressed, narrower; when
+        // stretched, wider. This exaggerates the jelly effect.
+        const dx = B.position.x - A.position.x;
+        const dy = B.position.y - A.position.y;
+        const d = Math.sqrt(dx * dx + dy * dy);
+        const restD = CELL_SIZE;
+        const stretch = Math.min(1.6, Math.max(0.6, d / restD));
+        const w = CELL_SIZE * 0.82 * stretch;
+        ctx.strokeStyle = color;
+        ctx.globalAlpha = 0.85;
+        ctx.lineWidth = w;
         ctx.beginPath();
-        ctx.arc(b.position.x, b.position.y, CELL_SIZE * 0.10, 0, Math.PI * 2);
+        ctx.moveTo(A.position.x, A.position.y);
+        ctx.lineTo(B.position.x, B.position.y);
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+
+      // Draw particle fills (slightly larger than collision radius for a
+      // bold jelly look)
+      for (const b of piece.particles) {
+        const r = PARTICLE_R;
+        // Outer halo
+        ctx.fillStyle = color + '55';
+        ctx.beginPath();
+        ctx.arc(b.position.x, b.position.y, r * 1.18, 0, Math.PI * 2);
         ctx.fill();
+        // Main fill
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.arc(b.position.x, b.position.y, r * 0.96, 0, Math.PI * 2);
+        ctx.fill();
+        // Highlight
+        ctx.fillStyle = '#ffffff';
+        ctx.globalAlpha = 0.35;
+        ctx.beginPath();
+        ctx.arc(b.position.x - r * 0.32, b.position.y - r * 0.32, r * 0.28, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.globalAlpha = 1;
       }
     }
 
     function render() {
-      // 1. Background
+      // Background
       ctx.fillStyle = '#0a0a14';
       ctx.fillRect(0, 0, BOARD_PX_W, BOARD_PX_H);
-
-      // 2. Grid
+      // Grid
       drawGrid();
-
-      // 3. Static walls
+      // Static walls
       drawWalls();
-
-      // 4. Pieces (locked first, current on top)
+      // Pieces: locked first, current on top
       for (const p of state.pieces) {
         if (p === state.current) continue;
-        if (p.locked) drawPieceMesh(p);
+        if (p.locked) drawPiece(p);
       }
-      if (state.current && !state.current.locked) drawPieceMesh(state.current);
+      if (state.current && !state.current.locked) drawPiece(state.current);
 
-      // 5. HUD text update (throttled)
-      hudTimer += 1;
-      if (hudTimer > 6) {
-        hudTimer = 0;
+      // HUD throttle
+      state.hudTimer++;
+      if (state.hudTimer > 4) {
+        state.hudTimer = 0;
         hudScore.textContent = String(state.score);
         hudLines.textContent = String(state.lines);
         hudLevel.textContent = String(state.level);
@@ -1149,23 +1120,26 @@
       nextCtx.fillRect(0, 0, nextCanvas.width, nextCanvas.height);
       const type = state.queue[0];
       if (!type) return;
-      const bitmap = BITMAPS[type];
+      const shape = SHAPES[type];
       const color = COLORS[type];
-      // Fit 4x4 cells max into 112px (4 cells * 28px). Use CELL_SIZE=22 for preview
-      const prevCell = 22;
-      const offX = (nextCanvas.width - bitmap.w * prevCell) / 2;
-      const offY = (nextCanvas.height - bitmap.h * prevCell) / 2;
+      // Fit the piece into 120x120
+      const cellW = nextCanvas.width / shape.w;
+      const cellH = nextCanvas.height / shape.h;
+      const prevCell = Math.min(cellW, cellH) * 0.85;
+      const offX = (nextCanvas.width - shape.w * prevCell) / 2;
+      const offY = (nextCanvas.height - shape.h * prevCell) / 2;
       nextCtx.fillStyle = color;
-      nextCtx.globalAlpha = 0.6;
+      nextCtx.globalAlpha = 0.65;
       nextCtx.strokeStyle = color;
-      nextCtx.lineWidth = 1.5;
-      for (let y = 0; y < bitmap.h; y++) {
-        for (let x = 0; x < bitmap.w; x++) {
-          if (bitmap.cells[y][x]) {
+      nextCtx.lineWidth = 2;
+      for (let y = 0; y < shape.h; y++) {
+        for (let x = 0; x < shape.w; x++) {
+          if (shape.cells[y][x]) {
             const px = offX + x * prevCell;
             const py = offY + y * prevCell;
-            nextCtx.fillRect(px + 1, py + 1, prevCell - 2, prevCell - 2);
-            nextCtx.strokeRect(px + 0.5, py + 0.5, prevCell - 1, prevCell - 1);
+            nextCtx.beginPath();
+            nextCtx.arc(px + prevCell / 2, py + prevCell / 2, prevCell * 0.42, 0, Math.PI * 2);
+            nextCtx.fill();
           }
         }
       }
@@ -1174,12 +1148,10 @@
 
     // ----- Restart -----
     function restart() {
-      // Tear down: remove all composites, walls
       const allBodies = Composite.allBodies(state.engine.world);
       for (const b of allBodies) Composite.remove(state.engine.world, b);
       const allCons = Composite.allConstraints(state.engine.world);
       for (const c of allCons) Composite.remove(state.engine.world, c);
-      // Reset state
       state.pieces = [];
       state.current = null;
       state.bag = [];
@@ -1190,14 +1162,14 @@
       state.softDrop = false;
       state.gameOver = false;
       overlay.classList.remove('on');
-      // Rebuild static walls (no ceiling)
-      const wallT = 20;
-      const wallH = BOARD_PX_H + 6 * CELL_SIZE;
+      // Rebuild walls
+      const wallT = 24;
+      const wallH = BOARD_PX_H + 4 * CELL_SIZE;
       const wallY = BOARD_Y + BOARD_PX_H / 2;
       Composite.add(state.engine.world, [
-        Bodies.rectangle(BOARD_X - 2 * CELL_SIZE, wallY, wallT, wallH, { isStatic: true, label: 'wall', friction: 0.3, restitution: 0.1 }),
-        Bodies.rectangle(BOARD_X + BOARD_PX_W + 2 * CELL_SIZE, wallY, wallT, wallH, { isStatic: true, label: 'wall', friction: 0.3, restitution: 0.1 }),
-        Bodies.rectangle(BOARD_X + BOARD_PX_W / 2, BOARD_Y + BOARD_PX_H + CELL_SIZE / 2, BOARD_PX_W + 4 * CELL_SIZE, CELL_SIZE, { isStatic: true, label: 'floor', friction: 0.9, restitution: 0.0 }),
+        Bodies.rectangle(BOARD_X - CELL_SIZE / 2 - wallT / 2, wallY, wallT, wallH, { isStatic: true, label: 'wall', friction: 0.2, restitution: 0.05 }),
+        Bodies.rectangle(BOARD_X + BOARD_PX_W + CELL_SIZE / 2 + wallT / 2, wallY, wallT, wallH, { isStatic: true, label: 'wall', friction: 0.2, restitution: 0.05 }),
+        Bodies.rectangle(BOARD_X + BOARD_PX_W / 2, BOARD_Y + BOARD_PX_H + CELL_SIZE / 2, BOARD_PX_W + 4 * CELL_SIZE + wallT * 2, CELL_SIZE, { isStatic: true, label: 'floor', friction: 0.9, restitution: 0.0 }),
       ]);
       ensureQueue();
       spawnPiece();
@@ -1208,7 +1180,6 @@
       initEngine();
       ensureQueue();
       spawnPiece();
-      // Debug hook for inspection in dev tools / playwright
       window.__jelly = state;
       window.addEventListener('keydown', onKeyDown, { passive: false });
       window.addEventListener('keyup', onKeyUp, { passive: true });
@@ -1221,7 +1192,6 @@
     }
 
     if (typeof Matter === 'undefined') {
-      // CDN failed entirely (offline)
       document.body.innerHTML = '<div style="padding:40px;color:#fff;font-family:sans-serif">Failed to load Matter.js. Check your network connection.</div>';
       return;
     }
