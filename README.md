@@ -10,7 +10,7 @@
 
 ## 🎬 라이브 데모
 
-> **👉 [https://jelly-tetris.vercel.app/](https://jelly-tetris.vercel.app/)** — 브라우저에서 바로 실행 (60fps)
+> **👉 [https://sigco3111.github.io/jelly-tetris/](https://sigco3111.github.io/jelly-tetris/)** — 브라우저에서 바로 실행 (60fps)
 
 | | |
 |---|---|
